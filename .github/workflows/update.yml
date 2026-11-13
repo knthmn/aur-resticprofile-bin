@@ -68,6 +68,9 @@ jobs:
     if: needs.check.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
     env:
       NEW: ${{ needs.check.outputs.new }}
     steps:

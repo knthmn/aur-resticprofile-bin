@@ -21,6 +21,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    env:
+      GIT_SSH_COMMAND: ssh -F /dev/null -i /tmp/ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=/tmp/ssh/known_hosts -o StrictHostKeyChecking=yes
     steps:
       - name: Install tools
         run: pacman -Syu --noconfirm --needed --disable-sandbox git openssh
@@ -39,11 +44,10 @@ jobs:
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
         run: |
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          echo "$AUR_HOST_KEY" > ~/.ssh/known_hosts
-          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/aur\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' > ~/.ssh/config
+          install -d -m 700 /tmp/ssh
+          printf '%s\n' "$AUR_SSH_KEY" > /tmp/ssh/aur
+          chmod 600 /tmp/ssh/aur
+          echo "$AUR_HOST_KEY" > /tmp/ssh/known_hosts
       - name: Commit and push to AUR
         run: |
           set -euo pipefail
