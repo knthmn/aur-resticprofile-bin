@@ -1,0 +1,283 @@
+name: Check for update
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream version to test, without v (default: latest release)"
+        required: false
+        default: ""
+      force:
+        description: "Run even if an update branch or issue already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-check
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: creativeprojects/resticprofile
+  PKG_BRANCH: master
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.v.outputs.proceed }}
+      old: ${{ steps.v.outputs.old }}
+      new: ${{ steps.v.outputs.new }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PKG_BRANCH }}
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          new="${INPUT_VERSION:-$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)}"
+          new="${new#v}"
+          old="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+          proceed=true
+          if [ "$new" = "$old" ]; then
+            echo "Package is already at $new"
+            proceed=false
+          elif [ "$FORCE" != "true" ]; then
+            if gh api "repos/$GITHUB_REPOSITORY/branches/update/v$new" >/dev/null 2>&1; then
+              echo "Branch update/v$new already exists"
+              proceed=false
+            fi
+            issues=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "v$new in:title" --json number -q length)
+            if [ "$issues" != "0" ]; then
+              echo "An open issue for v$new already exists"
+              proceed=false
+            fi
+          fi
+          echo "old=$old new=$new proceed=$proceed"
+          { echo "old=$old"; echo "new=$new"; echo "proceed=$proceed"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      NEW: ${{ needs.check.outputs.new }}
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed --disable-sandbox git pacman-contrib namcap
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PKG_BRANCH }}
+          path: pkg
+      - name: Bump, build, install and run
+        working-directory: pkg
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+          r=../results/build.md
+          useradd -m builder
+          chown -R builder .
+          sed -i "s/^pkgver=.*/pkgver=$NEW/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          runuser -u builder -- updpkgsums
+          runuser -u builder -- makepkg --printsrcinfo > .SRCINFO
+          echo "## x86_64 build" > "$r"
+          echo >> "$r"
+
+          curl -fsSL "https://github.com/$UPSTREAM/releases/download/v$NEW/checksums.txt" -o ../checksums.txt
+          for pair in x86_64:amd64 aarch64:arm64 armv6h:armv6 armv7h:armv7; do
+            arch=${pair%%:*}
+            asset="resticprofile_${NEW}_linux_${pair#*:}.tar.gz"
+            ours=$(sed -n "s/^sha256sums_$arch=('\(.*\)')/\1/p" PKGBUILD)
+            theirs=$(awk -v f="$asset" '$2 == f {print $1}' ../checksums.txt)
+            if [ -z "$ours" ] || [ "$ours" != "$theirs" ]; then
+              echo "- FAIL: $arch checksum does not match upstream checksums.txt" >> "$r"
+              exit 1
+            fi
+          done
+          echo "- PASS: all 4 checksums match upstream checksums.txt" >> "$r"
+
+          runuser -u builder -- makepkg --noconfirm --nodeps
+          echo "- PASS: makepkg" >> "$r"
+          pacman -U --noconfirm --disable-sandbox "resticprofile-bin-$NEW-1-x86_64.pkg.tar.zst"
+          echo "- PASS: pacman -U (installs dependency restic)" >> "$r"
+          out=$(resticprofile version)
+          echo "$out"
+          if ! grep -q "^resticprofile version $NEW " <<<"$out"; then
+            echo "- FAIL: \`resticprofile version\` printed \`$out\`" >> "$r"
+            exit 1
+          fi
+          echo "- PASS: \`resticprofile version\` printed \`$out\`" >> "$r"
+
+          {
+            echo
+            echo "<details><summary>namcap</summary>"
+            echo
+            echo '```'
+            namcap PKGBUILD "resticprofile-bin-$NEW-1-x86_64.pkg.tar.zst" 2>&1 || true
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$r"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: build
+          include-hidden-files: true
+          path: |
+            pkg/PKGBUILD
+            pkg/.SRCINFO
+            results/
+
+  arm:
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, armv6, armv7]
+    env:
+      NEW: ${{ needs.check.outputs.new }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64,arm
+      - name: Verify and run binary
+        run: |
+          set -euo pipefail
+          asset="resticprofile_${NEW}_linux_${ARCH}.tar.gz"
+          base="https://github.com/$UPSTREAM/releases/download/v$NEW"
+          curl -fsSLO "$base/$asset"
+          curl -fsSLO "$base/checksums.txt"
+          grep " $asset\$" checksums.txt | sha256sum -c -
+          mkdir x
+          tar -xzf "$asset" -C x
+          file x/resticprofile
+          out=$(x/resticprofile version)
+          echo "$out"
+          grep -q "^resticprofile version $NEW " <<<"$out"
+          echo "$out" >> "$GITHUB_STEP_SUMMARY"
+
+  audit:
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    env:
+      OLD: ${{ needs.check.outputs.old }}
+      NEW: ${{ needs.check.outputs.new }}
+      HAS_COPILOT: ${{ secrets.COPILOT_PAT != '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scripted audit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/audit.py
+      - uses: actions/setup-node@v7
+        if: env.HAS_COPILOT == 'true'
+      - name: Install Copilot CLI
+        if: env.HAS_COPILOT == 'true'
+        run: npm install -g @github/copilot
+      - name: AI review
+        id: ai
+        if: env.HAS_COPILOT == 'true'
+        continue-on-error: true
+        uses: actions/ai-inference@v3
+        with:
+          prompt-file: results/prompt.txt
+          system-prompt-file: prompts/audit-system.txt
+          model: ""
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+      - name: Save AI review
+        if: steps.ai.outcome == 'success'
+        env:
+          RESPONSE_FILE: ${{ steps.ai.outputs.response-file }}
+        run: cp "$RESPONSE_FILE" results/ai.md
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: audit
+          path: results/
+
+  report:
+    needs: [check, build, arm, audit]
+    if: always() && needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      OLD: ${{ needs.check.outputs.old }}
+      NEW: ${{ needs.check.outputs.new }}
+      BUILD: ${{ needs.build.result }}
+      ARM: ${{ needs.arm.result }}
+      AUDIT: ${{ needs.audit.result }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PKG_BRANCH }}
+          path: pkg
+      - uses: actions/download-artifact@v8
+        with:
+          path: art
+      - name: Compose report
+        run: |
+          {
+            echo "Upstream release: https://github.com/$UPSTREAM/releases/tag/v$NEW"
+            echo "Upstream diff: https://github.com/$UPSTREAM/compare/v$OLD...v$NEW"
+            echo "Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "| x86_64: checksums, makepkg, pacman -U, resticprofile version | $BUILD |"
+            echo "| arm64, armv6, armv7: checksums, resticprofile version under QEMU | $ARM |"
+            echo "| Audit | $AUDIT |"
+            echo
+            cat art/build/results/build.md 2>/dev/null || echo "No build report."
+            echo
+            echo "## AI review (Copilot)"
+            echo
+            if [ -f art/audit/ai.md ]; then
+              cat art/audit/ai.md
+            else
+              echo "Not available. Check that the COPILOT_PAT secret is set and see the workflow run."
+            fi
+            echo
+            cat art/audit/audit.md 2>/dev/null || echo "No scripted audit report."
+            echo
+            echo "---"
+            echo "Merging this pull request publishes the package to the AUR."
+          } > full.md
+          head -c 60000 full.md > body.md
+      - name: Open or update pull request
+        if: needs.build.result == 'success'
+        working-directory: pkg
+        run: |
+          set -euo pipefail
+          cp ../art/build/pkg/PKGBUILD ../art/build/pkg/.SRCINFO .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "update/v$NEW"
+          git commit -am "chore: bump to v$NEW"
+          git push -f origin "update/v$NEW"
+          pr=$(gh pr list --head "update/v$NEW" --state open --json number -q '.[0].number')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --body-file ../body.md
+          else
+            gh pr create --base "$PKG_BRANCH" --head "update/v$NEW" --title "resticprofile-bin v$NEW" --body-file ../body.md
+          fi
+      - name: Open issue
+        if: needs.build.result != 'success'
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" --title "resticprofile-bin v$NEW: update check failed" --body-file body.md

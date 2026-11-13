@@ -1,0 +1,64 @@
+name: Publish to AUR
+
+on:
+  push:
+    branches: [master]
+    paths: [PKGBUILD, .SRCINFO]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  AUR_REPO: ssh://aur@aur.archlinux.org/resticprofile-bin.git
+  AUR_HOST_KEY: aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed --disable-sandbox git openssh
+      - uses: actions/checkout@v7
+        with:
+          path: src
+          fetch-depth: 0
+      - name: Check that .SRCINFO matches PKGBUILD
+        working-directory: src
+        run: |
+          useradd -m builder
+          chown -R builder .
+          runuser -u builder -- makepkg --printsrcinfo > /tmp/SRCINFO
+          diff -u .SRCINFO /tmp/SRCINFO
+      - name: Configure SSH
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          echo "$AUR_HOST_KEY" > ~/.ssh/known_hosts
+          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/aur\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' > ~/.ssh/config
+      - name: Commit and push to AUR
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          git clone "$AUR_REPO" aur
+          cp src/PKGBUILD src/.SRCINFO src/.gitignore aur/
+          cd aur
+          git add PKGBUILD .SRCINFO .gitignore
+          if git diff --cached --quiet; then
+            echo "AUR is already up to date"
+            exit 0
+          fi
+          msg=$(git -C ../src log -1 --format=%B -- PKGBUILD .SRCINFO)
+          author=$(git -C ../src log -1 --format='%an <%ae>' -- PKGBUILD .SRCINFO)
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --author="$author" -m "$msg" -m "Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+          git show --stat HEAD
+          git push origin master
