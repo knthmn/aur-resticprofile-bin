@@ -8,7 +8,7 @@ The AUR receives only `PKGBUILD`, `.SRCINFO` and `.gitignore`. Do not push this 
 
 ### Check for update (`update.yml`)
 
-Runs every day and on manual dispatch. If upstream has a new release, it:
+Runs every 3 hours and on manual dispatch. If upstream has a new release, it:
 
 1. Bumps `PKGBUILD`, runs `updpkgsums` and regenerates `.SRCINFO` in an Arch Linux container.
 2. Compares all checksums with upstream `checksums.txt`.
